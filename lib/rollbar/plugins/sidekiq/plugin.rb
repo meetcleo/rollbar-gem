@@ -1,23 +1,25 @@
 require 'rollbar/scrubbers/params'
+require 'rollbar/worker_data_extractor'
 
 module Rollbar
   class Sidekiq
     PARAM_BLACKLIST = %w[backtrace error_backtrace error_message error_class].freeze
+    include WorkerDataExtractor
 
     class ResetScope
-      def call(_worker, msg, _queue, &block)
+      def call(worker, msg, _queue, &block)
         Rollbar.reset_notifier! # clears scope
 
         return yield unless Rollbar.configuration.sidekiq_use_scoped_block
 
-        Rollbar.scoped(Rollbar::Sidekiq.job_scope(msg), &block)
+        Rollbar.scoped(Rollbar::Sidekiq.job_scope(msg, worker: worker), &block)
       end
     end
 
-    def self.handle_exception(msg, e)
+    def self.handle_exception(msg, e, worker: nil)
       return if skip_report?(msg, e)
 
-      Rollbar.scope(job_scope(msg)).error(e, :use_exception_level_filters => true)
+      Rollbar.scope(job_scope(msg, worker: worker)).error(e, :use_exception_level_filters => true)
     end
 
     def self.skip_report?(msg, _e)
@@ -31,9 +33,10 @@ module Rollbar
       job_hash['retry'] && actual_retry_count < ::Rollbar.configuration.sidekiq_threshold
     end
 
-    def self.job_scope(msg)
+    def self.job_scope(msg, worker: nil)
       scope = {
-        :framework => "Sidekiq: #{::Sidekiq::VERSION}"
+        :framework => "Sidekiq: #{::Sidekiq::VERSION}",
+        :person => person_data_proc(worker)
       }
       job_hash = job_hash_from_msg(msg)
 
@@ -47,6 +50,10 @@ module Rollbar
       scope
     end
 
+    def self.person_data_proc(worker)
+      proc { extract_person_data_from_worker(worker) }
+    end
+
     def self.scrub_params(params)
       options = {
         :params => params,
@@ -57,14 +64,14 @@ module Rollbar
     end
 
     # see https://github.com/mperham/sidekiq/wiki/Middleware#server-middleware
-    def call(_worker, msg, _queue, &block)
+    def call(worker, msg, _queue, &block)
       Rollbar.reset_notifier! # clears scope
 
       return yield unless Rollbar.configuration.sidekiq_use_scoped_block
 
-      Rollbar.scoped(Rollbar::Sidekiq.job_scope(msg), &block)
+      Rollbar.scoped(Rollbar::Sidekiq.job_scope(msg, worker: worker), &block)
     rescue Exception => e # rubocop:disable Lint/RescueException
-      Rollbar::Sidekiq.handle_exception(msg, e)
+      Rollbar::Sidekiq.handle_exception(msg, e, worker: worker)
       raise
     end
 

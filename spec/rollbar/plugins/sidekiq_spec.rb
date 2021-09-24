@@ -1,10 +1,19 @@
 require 'spec_helper'
+require 'rollbar/worker_methods'
 
 require 'sidekiq'
 
 Rollbar.plugins.load!
 
 describe Rollbar::Sidekiq, :reconfigure_notifier => false do
+  class Worker
+    include Rollbar::WorkerMethods
+    User = Struct.new(:id, :username, :email)
+
+    def current_user
+      User.new(1, 'Mike', 'mike@test.com')
+    end
+  end
   describe '.handle_exception' do
     let(:exception) { StandardError.new('oh noes') }
     let(:rollbar) { double }
@@ -36,15 +45,26 @@ describe Rollbar::Sidekiq, :reconfigure_notifier => false do
         },
         :framework => "Sidekiq: #{Sidekiq::VERSION}",
         :context => job_hash['class'],
-        :queue => job_hash['queue']
+        :queue => job_hash['queue'],
+        :person => kind_of(Proc)
       }
     end
+    let(:worker) { Worker.new }
 
     it 'constructs scope from msg' do
       allow(rollbar).to receive(:error)
       expect(Rollbar).to receive(:scope).with(expected_scope) { rollbar }
 
       described_class.handle_exception(msg, exception)
+    end
+
+    it 'includes person data' do
+      reconfigure_notifier
+      Rollbar.configure { |config| config.person_email_method = 'email' }
+      Rollbar.configure { |config| config.person_username_method = 'username' }
+      described_class.handle_exception(job_hash, exception, worker: worker)
+
+      expect(Rollbar.last_report[:person]).to be_eql({:email => 'mike@test.com', :id => 1, :username => 'Mike'})
     end
 
     context 'sidekiq < 4.2.3 msg' do
@@ -64,7 +84,8 @@ describe Rollbar::Sidekiq, :reconfigure_notifier => false do
       it 'constructs scope from msg' do
         allow(rollbar).to receive(:error)
         expect(Rollbar).to receive(:scope).with(
-          :framework => "Sidekiq: #{Sidekiq::VERSION}"
+          :framework => "Sidekiq: #{Sidekiq::VERSION}",
+          :person => kind_of(Proc)
         ) { rollbar }
 
         described_class.handle_exception(msg, exception)
@@ -158,14 +179,15 @@ describe Rollbar::Sidekiq, :reconfigure_notifier => false do
     let(:msg) { { 'class' => 'SomeWorker', 'queue' => 'default' } }
     let(:exception) { StandardError.new('oh noes') }
     let(:middleware_block) { proc { raise exception } }
+    let(:worker) { Worker.new }
 
     subject { Rollbar::Sidekiq.new }
 
     it 'sends the error to Rollbar::Sidekiq.handle_exception' do
       expect(Rollbar).to receive(:reset_notifier!)
-      expect(Rollbar::Sidekiq).to receive(:handle_exception).with(msg, exception)
+      expect(Rollbar::Sidekiq).to receive(:handle_exception).with(msg, exception, worker: worker)
 
-      expect { subject.call(nil, msg, nil, &middleware_block) }.to raise_error(exception)
+      expect { subject.call(worker, msg, nil, &middleware_block) }.to raise_error(exception)
     end
 
     context 'when the block calls Rollbar.log without raising an error' do
@@ -192,7 +214,7 @@ describe Rollbar::Sidekiq, :reconfigure_notifier => false do
 
         it 'sends the scope information to rollbar' do
           expect(Rollbar).to receive(:log) do
-            expect(Rollbar.scope_object).to be_eql(described_class.job_scope(msg))
+            expect(Rollbar.scope_object.except(:person)).to be_eql(described_class.job_scope(msg).except(:person))
           end
 
           subject.call(nil, msg, nil, &middleware_block)
